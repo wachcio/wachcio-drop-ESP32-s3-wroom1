@@ -16,6 +16,8 @@
 #define LED_GPIO 14
 static const char *TAG = "WachcioDrop_Server";
 
+static esp_netif_t *sta_netif = NULL;
+
 void blink_task(void *pvParameter)
 {
     gpio_reset_pin(LED_GPIO);
@@ -28,7 +30,6 @@ void blink_task(void *pvParameter)
     }
 }
 
-// Zapisz dane Wi-Fi do NVS
 void save_wifi_credentials(const char* ssid, const char* password) {
     nvs_handle_t nvs_handle;
     if (nvs_open("wifi_creds", NVS_READWRITE, &nvs_handle) == ESP_OK) {
@@ -42,10 +43,10 @@ void save_wifi_credentials(const char* ssid, const char* password) {
     }
 }
 
-// Handler HTTP GET dla root (formularz Wi-Fi)
 esp_err_t root_get_handler(httpd_req_t *req)
 {
-    const char* resp_str = "<html><body><h1>WachcioDrop Provisioning Portal</h1>"
+    const char* resp_str = "<html><body><h1>WachcioDrop. </h1>"
+                            "<H2>Enter the name of your network and the password you want to connect to</H2>"
                            "<form action=\"/submit\" method=\"post\">"
                            "SSID: <input type=\"text\" name=\"ssid\"><br>"
                            "Password: <input type=\"password\" name=\"password\"><br>"
@@ -56,29 +57,48 @@ esp_err_t root_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Ustawienia Wi-Fi z zapisanych danych i połącz się
 void wifi_connect(const char* ssid, const char* password)
 {
-    ESP_LOGI(TAG, "WiFi connecting to SSID:%s", ssid);
+    ESP_LOGI(TAG, "Connecting to SSID:%s", ssid);
+
     wifi_config_t wifi_config = { 0 };
     strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid)-1);
     strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password)-1);
 
-    esp_wifi_stop();
-    esp_wifi_deinit();
+    ESP_ERROR_CHECK(esp_wifi_disconnect());
 
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-    esp_wifi_connect();
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
-// Handler HTTP POST dla /submit (odbiera i zapisuje ssid i hasło)
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT) {
+        switch(event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "WiFi started, connecting...");
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                ESP_LOGI(TAG, "Disconnected, retrying...");
+                esp_wifi_connect();
+                break;
+            case WIFI_EVENT_AP_STACONNECTED:
+                ESP_LOGI(TAG, "Client connected to AP");
+                break;
+            case WIFI_EVENT_AP_STADISCONNECTED:
+                ESP_LOGI(TAG, "Client disconnected from AP");
+                break;
+            default:
+                break;
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
 esp_err_t submit_post_handler(httpd_req_t *req)
 {
     char buf[128];
@@ -90,7 +110,6 @@ esp_err_t submit_post_handler(httpd_req_t *req)
     }
     buf[ret] = '\0';
 
-    // Proste parsowanie danych POST, formatu: ssid=name&password=pass
     char ssid[32] = {0};
     char password[64] = {0};
     sscanf(buf, "ssid=%31[^&]&password=%63s", ssid, password);
@@ -99,7 +118,6 @@ esp_err_t submit_post_handler(httpd_req_t *req)
 
     save_wifi_credentials(ssid, password);
 
-    // Po zapisaniu próbujemy połączyć się z podaną siecią
     wifi_connect(ssid, password);
 
     const char* resp = "<html><body><h2>Settings saved. Connecting to WiFi...</h2></body></html>";
@@ -136,13 +154,18 @@ httpd_handle_t start_webserver(void)
 
 void wifi_init_softap(void)
 {
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_ap();
+    sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(sta_netif, "WachcioDrop");
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     wifi_config_t wifi_config = {
         .ap = {
@@ -154,9 +177,9 @@ void wifi_init_softap(void)
         },
     };
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "SoftAP started. SSID:%s", wifi_config.ap.ssid);
 }
@@ -165,7 +188,7 @@ void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
+        ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
